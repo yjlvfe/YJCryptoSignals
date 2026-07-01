@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# 🏛️ CryptoSignal Control — V1 + V2 Twin Engine Management
+set -euo pipefail
+
+V1_NAME="cryptosignal-v1"
+V2_NAME="cryptosignal-v2"
+V1_DIR="/root/projects/crypto-signal"
+V2_DIR="/root/projects/crypto-signal-v2"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; NC='\033[0m'; BOLD='\033[1m'
+
+# ─── Helper: filter to only services that have a unit file ───
+_filter_existing_services() {
+    local names=("$@")
+    local existing=()
+    for name in "${names[@]}"; do
+        if systemctl cat "$name" &>/dev/null; then
+            existing+=("$name")
+        else
+            echo -e "  ${YELLOW}⚠${NC} $name: service not found, skipping" >&2
+        fi
+    done
+    echo "${existing[@]}"
+}
+
+help() {
+    echo -e "${CYAN}🏛️ CryptoSignal Twin Engine Control${NC}"
+    echo "Usage: cryptosignal-ctl <command> [target]"
+    echo ""
+    echo "Commands:"
+    echo "  status          Show both engines status"
+    echo "  start  [v1|v2|all]  Start engine(s)"
+    echo "  stop   [v1|v2|all]  Stop engine(s)"
+    echo "  restart[v1|v2|all]  Restart engine(s)"
+    echo "  logs   [v1|v2|all] [n]  Show logs (last n lines)"
+    echo "  watch  [v1|v2|all]  Tail logs in real-time"
+    echo "  enable [v1|v2|all]  Enable auto-start on boot"
+    echo "  disable[v1|v2|all]  Disable auto-start"
+    echo "  venv   [v1|v2|all]  Rebuild Python venv from requirements"
+    echo "  compare        Run Signal Comparator (V1 vs V2)"
+    echo "  bus   status    Check Market Data Bus health"
+    echo "  doctor         Full system health check"
+}
+
+status_bar() {
+    local label="$1" status="$2" mem="$3" pid="$4" uptime="$5"
+    if [[ "$status" == "active" ]]; then
+        echo -e "  ${GREEN}●${NC} ${BOLD}$label${NC}  mem=${mem}  pid=${pid}  uptime=${uptime}"
+    else
+        echo -e "  ${RED}✗${NC} ${BOLD}$label${NC}  status=${status}"
+    fi
+}
+
+cmd_status() {
+    echo -e "${CYAN}═══════════════════════════════════════${NC}"
+    echo -e "${BOLD}🏛️  CryptoSignal Twin Engine Status${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════${NC}"
+    
+    local all_services=($V1_NAME $V2_NAME)
+    local existing_services=($(_filter_existing_services "${all_services[@]}"))
+    for svc in "${existing_services[@]}"; do
+        local s=$(systemctl is-active "$svc" 2>/dev/null || echo "not found")
+        local mem="—"; local pid="—"; local uptime="—"
+        if [[ "$s" == "active" ]]; then
+            mem=$(systemctl show "$svc" -p MemoryCurrent --value 2>/dev/null | numfmt --to=iec 2>/dev/null || echo "?")
+            pid=$(systemctl show "$svc" -p MainPID --value 2>/dev/null)
+            uptime=$(systemctl show "$svc" -p ActiveEnterTimestamp --value 2>/dev/null | sed 's/.*2\(.*\)/\1/' || echo "?")
+        fi
+        local label="$svc"
+        [[ "$svc" == "$V1_NAME" ]] && label+=" (V1 Legacy)" || label+=" (V2 NextGen)"
+        status_bar "$label" "$s" "$mem" "$pid" "$uptime"
+    done
+    
+    echo ""
+    echo -e "${CYAN}📊 Resource Overview:${NC}"
+    echo "  $(free -h | grep Mem | awk '{print "RAM: " $3 " / " $2}')"
+    echo "  $(df -h / | tail -1 | awk '{print "Disk: " $3 " / " $2 " (" $5 ")"}')"
+    
+    echo ""
+    echo -e "${CYAN}🔒 Isolation Check:${NC}"
+    local v1_venv="/root/projects/crypto-signal/venv/bin/python3"
+    local v2_venv="/root/projects/crypto-signal-v2/venv/bin/python3"
+    [[ -x "$v1_venv" ]] && echo -e "  🐍 V1 venv: ${GREEN}✓${NC}" || echo -e "  🐍 V1 venv: ${RED}✗${NC}"
+    [[ -x "$v2_venv" ]] && echo -e "  🐍 V2 venv: ${GREEN}✓${NC}" || echo -e "  🐍 V2 venv: ${RED}✗${NC}"
+    
+    # Check memory limits
+    local v1_mem=$(systemctl show $V1_NAME -p MemoryMax --value 2>/dev/null)
+    local v2_mem=$(systemctl show $V2_NAME -p MemoryMax --value 2>/dev/null)
+    echo -e "  🛡️ V1 MemoryMax: ${v1_mem:-none}"
+    echo -e "  🛡️ V2 MemoryMax: ${v2_mem:-none}"
+    
+    # Check lock files
+    [[ -f /tmp/cryptosignal.lock ]] && echo -e "  🔒 V1 lock: $(cat /tmp/cryptosignal.lock)" || echo -e "  🔒 V1 lock: ${RED}absent${NC}"
+    [[ -f /tmp/cryptosignal-v2.lock ]] && echo -e "  🔒 V2 lock: $(cat /tmp/cryptosignal-v2.lock)" || echo -e "  🔒 V2 lock: ${RED}absent${NC}"
+    
+    # Data bus
+    echo -e "  📡 Data Bus: $(systemctl is-active cryptosignal-bus 2>/dev/null || echo 'not installed')"
+}
+
+cmd_logs() {
+    local target="${1:-both}" lines="${2:-50}"
+    local filters=()
+    case "$target" in
+        v1|V1) filters=("$V1_NAME") ;;
+        v2|V2) filters=("$V2_NAME") ;;
+        all|both) filters=("$V1_NAME" "$V2_NAME") ;;
+        *) echo "Unknown target: $target"; exit 1 ;;
+    esac
+    local existing_filters=($(_filter_existing_services "${filters[@]}"))
+    if [[ ${#existing_filters[@]} -eq 0 ]]; then
+        echo -e "  ${YELLOW}⚠${NC} No matching services found."
+        return
+    fi
+    for svc in "${existing_filters[@]}"; do
+        echo -e "${CYAN}─── $svc ───${NC}"
+        journalctl -u "$svc" --no-pager -n "$lines" 2>/dev/null || echo "(no logs)"
+    done
+}
+
+cmd_watch() {
+    local target="${1:-all}"
+    case "$target" in
+        v1) journalctl -u "$V1_NAME" -f ;;
+        v2)
+            if systemctl cat "$V2_NAME" &>/dev/null; then
+                journalctl -u "$V2_NAME" -f
+            else
+                echo -e "  ${YELLOW}⚠${NC} $V2_NAME: service not found"
+            fi
+            ;;
+        all|both)
+            local cmds=()
+            systemctl cat "$V1_NAME" &>/dev/null && cmds+=(-u "$V1_NAME")
+            systemctl cat "$V2_NAME" &>/dev/null && cmds+=(-u "$V2_NAME")
+            if [[ ${#cmds[@]} -eq 0 ]]; then
+                echo -e "  ${YELLOW}⚠${NC} No matching services found."
+                return
+            fi
+            journalctl "${cmds[@]}" -f
+            ;;
+        *) echo "Unknown target: $target"; exit 1 ;;
+    esac
+}
+
+cmd_start_stop_restart() {
+    local action="$1" target="${2:-all}"
+    local services=()
+    case "$target" in
+        v1|V1) services=("$V1_NAME") ;;
+        v2|V2) services=("$V2_NAME") ;;
+        all|both) services=("$V1_NAME" "$V2_NAME") ;;
+        *) echo "Unknown target: $target"; exit 1 ;;
+    esac
+    local existing_services=($(_filter_existing_services "${services[@]}"))
+    if [[ ${#existing_services[@]} -eq 0 ]]; then
+        echo -e "  ${YELLOW}⚠${NC} No matching services found."
+        return
+    fi
+    for svc in "${existing_services[@]}"; do
+        echo -e "  ${BOLD}$action $svc...${NC}"
+        systemctl "$action" "$svc"
+    done
+}
+
+cmd_enable_disable() {
+    local action="$1" target="${2:-all}"
+    local services=()
+    case "$target" in
+        v1|V1) services=("$V1_NAME") ;;
+        v2|V2) services=("$V2_NAME") ;;
+        all|both) services=("$V1_NAME" "$V2_NAME") ;;
+        *) echo "Unknown target: $target"; exit 1 ;;
+    esac
+    local existing_services=($(_filter_existing_services "${services[@]}"))
+    if [[ ${#existing_services[@]} -eq 0 ]]; then
+        echo -e "  ${YELLOW}⚠${NC} No matching services found."
+        return
+    fi
+    for svc in "${existing_services[@]}"; do
+        systemctl "$action" "$svc"
+        echo -e "  $action $svc: ${GREEN}✓${NC}"
+    done
+}
+
+cmd_venv() {
+    local target="${1:-all}"
+    rebuild_venv() {
+        local dir="$1" label="$2"
+        echo -e "  ${YELLOW}Rebuilding $label venv...${NC}"
+        cd "$dir"
+        rm -rf venv
+        python3 -m venv venv
+        source venv/bin/activate
+        pip install --quiet -r requirements.txt
+        echo -e "  ${GREEN}$label venv ready${NC}"
+    }
+    case "$target" in
+        v1) rebuild_venv "$V1_DIR" "V1" ;;
+        v2) rebuild_venv "$V2_DIR" "V2" ;;
+        all|both) rebuild_venv "$V1_DIR" "V1" & rebuild_venv "$V2_DIR" "V2" & wait
+            echo -e "  ${GREEN}Both venvs rebuilt${NC}" ;;
+    esac
+}
+
+cmd_doctor() {
+    local exit_code=0
+    
+    echo -e "${CYAN}═══════════════════════════════════════${NC}"
+    echo -e "${BOLD}🩺 CryptoSignal Full Health Check${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════${NC}"
+    
+    echo -e "\n${BOLD}1. Services${NC}"
+    local all_doc_services=($V1_NAME $V2_NAME)
+    local existing_doc_services=($(_filter_existing_services "${all_doc_services[@]}" 2>/dev/null))
+    for svc in "${existing_doc_services[@]}"; do
+        local s=$(systemctl is-active "$svc" 2>/dev/null)
+        if [[ "$s" == "active" ]]; then
+            echo -e "  ${GREEN}✓${NC} $svc: running"
+        else
+            echo -e "  ${RED}✗${NC} $svc: $s"
+            exit_code=1
+        fi
+    done
+    
+    echo -e "\n${BOLD}2. Python Venvs${NC}"
+    for dir in "$V1_DIR" "$V2_DIR"; do
+        local venv="$dir/venv/bin/python3"
+        if [[ -x "$venv" ]]; then
+            local ver=$("$venv" --version 2>/dev/null)
+            echo -e "  ${GREEN}✓${NC} $dir/venv: $ver"
+        else
+            echo -e "  ${RED}✗${NC} $dir/venv: NOT FOUND"
+            exit_code=1
+        fi
+    done
+    
+    echo -e "\n${BOLD}3. Memory Limits${NC}"
+    local mem_svcs=($V1_NAME $V2_NAME)
+    local existing_mem_svcs=($(_filter_existing_services "${mem_svcs[@]}" 2>/dev/null))
+    for svc in "${existing_mem_svcs[@]}"; do
+        local mem=$(systemctl show "$svc" -p MemoryMax --value 2>/dev/null)
+        if [[ -n "$mem" && "$mem" != "infinity" && "$mem" != "18446744073709551615" ]]; then
+            echo -e "  ${GREEN}✓${NC} $svc: $mem"
+        else
+            echo -e "  ${RED}✗${NC} $svc: NO memory limit"
+            exit_code=1
+        fi
+    done
+    
+    echo -e "\n${BOLD}4. Lock Files${NC}"
+    [[ -f /tmp/cryptosignal.lock ]] && echo -e "  ${GREEN}✓${NC} V1 lock present" || { echo -e "  ${YELLOW}⚠${NC} V1 lock absent (normal if stopped)"; }
+    [[ -f /tmp/cryptosignal-v2.lock ]] && echo -e "  ${GREEN}✓${NC} V2 lock present" || { echo -e "  ${YELLOW}⚠${NC} V2 lock absent (normal if stopped)"; }
+    
+    echo -e "\n${BOLD}5. Network Connectivity${NC}"
+    if curl -s --max-time 5 https://api.telegram.org >/dev/null 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Telegram API reachable"
+    else
+        echo -e "  ${RED}✗${NC} Telegram API unreachable"
+        exit_code=1
+    fi
+    if curl -s --max-time 5 https://api.binance.com >/dev/null 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Binance API reachable"
+    else
+        echo -e "  ${YELLOW}⚠${NC} Binance API unreachable (might be network)"
+    fi
+    
+    echo -e "\n${BOLD}6. Data Bus${NC}"
+    local bus_svc="cryptosignal-bus"
+    if systemctl is-active "$bus_svc" >/dev/null 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Data Bus running"
+    else
+        echo -e "  ${YELLOW}⚠${NC} Data Bus not running (Phase 2 feature)"
+    fi
+    
+    echo ""
+    if [[ $exit_code -eq 0 ]]; then
+        echo -e "  ${GREEN}✅ ALL CHECKS PASSED${NC}"
+    else
+        echo -e "  ${RED}❌ SOME CHECKS FAILED${NC}"
+    fi
+    return $exit_code
+}
+
+cmd_compare() {
+    echo -e "${CYAN}═══════════════════════════════════════${NC}"
+    echo -e "${BOLD}📊 Signal Comparator — V1 vs V2${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════${NC}"
+    
+    if [[ -x "/opt/cryptosignal-bus/comparator.py" ]]; then
+        python3 /opt/cryptosignal-bus/comparator.py 2>/dev/null || echo "  ${YELLOW}⚠ Comparator needs data (no trades yet?)${NC}"
+    else
+        echo "  ${YELLOW}⚠ Comparator not installed${NC}"
+    fi
+}
+
+# ─── MAIN ───
+case "${1:-help}" in
+    status)     cmd_status ;;
+    logs)       cmd_logs "${2:-both}" "${3:-50}" ;;
+    watch)      cmd_watch "${2:-all}" ;;
+    start)      cmd_start_stop_restart "start" "${2:-all}" ;;
+    stop)       cmd_start_stop_restart "stop" "${2:-all}" ;;
+    restart)    cmd_start_stop_restart "restart" "${2:-all}" ;;
+    enable)     cmd_enable_disable "enable" "${2:-all}" ;;
+    disable)    cmd_enable_disable "disable" "${2:-all}" ;;
+    venv)       cmd_venv "${2:-all}" ;;
+    compare)    cmd_compare ;;
+    doctor)     cmd_doctor ;;
+    help|*)     help ;;
+esac

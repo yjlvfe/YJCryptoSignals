@@ -45,3 +45,9 @@ Thumbs.db
 docker-compose.override.yml
 engine/API_KEYS_BACKUP_20260615.md
 engine/ai_analyst.py.backup_*
+
+# .md docs (except README/LICENSE)
+*.md
+!README.md
+!LICENSE
+!LICENSE.md

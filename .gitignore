@@ -30,9 +30,11 @@ env/
 /root/.crypto-signal-bot/
 *.json.bak
 
-# Logs
-logs/*.log
+# Logs — all rotated, compressed, and live log artifacts
+logs/
 *.log
+*.log.*
+*.gz
 
 # Archive — ملفات محذوفة
 _archive/
